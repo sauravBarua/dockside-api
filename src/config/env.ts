@@ -10,6 +10,12 @@ const schema = z.object({
     .positive()
     .default(5000),
   DATABASE_URL: z.url(),
+  JWT_ACCESS_SECRET: z.string().min(32),
+  JWT_EXPIRES_IN_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(604800),
 });
 
 const result = schema.safeParse(process.env);
