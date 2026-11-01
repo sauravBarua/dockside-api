@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: dockside-db-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dockside
+      POSTGRES_PASSWORD: dockside
+      POSTGRES_DB: dockside
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - dockside-pg-dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dockside -d dockside"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  dockside-pg-dev:

@@ -9,6 +9,7 @@ const schema = z.object({
     .int()
     .positive()
     .default(5000),
+  DATABASE_URL: z.url(),
 });
 
 const result = schema.safeParse(process.env);
