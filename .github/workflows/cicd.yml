@@ -1,0 +1,136 @@
+name: API CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dockside
+          POSTGRES_PASSWORD: dockside
+          POSTGRES_DB: dockside_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U dockside -d dockside_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm generate
+        env:
+          DATABASE_URL: postgresql://build:build@localhost:5432/build
+
+      - run: pnpm lint
+      - run: pnpm build
+      - run: pnpm test
+
+  docker:
+    if: github.event_name == 'push'
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.prod
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/dockside-api:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/dockside-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host dockside
+            HostName $VPS_HOST
+            User $VPS_USER
+            IdentityFile ~/.ssh/id_deploy
+            BatchMode yes
+            ServerAliveInterval 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Log in to Docker Hub on the server
+        run: |
+          printf '%s' "$DOCKERHUB_TOKEN" \
+            | ssh dockside "docker login --username '$DOCKERHUB_USERNAME' --password-stdin"
+
+      - name: Deploy api
+        run: |
+          ssh dockside bash -s -- "$IMAGE_TAG" <<'REMOTE'
+          set -euo pipefail
+          TAG="$1"
+          case "$TAG" in
+            *[!0-9a-f]*|"") echo "Invalid image tag"; exit 1 ;;
+          esac
+          cd ~/dockside
+          COMPOSE="docker compose -f docker-compose.prod.yaml"
+
+          sed -i "s|^API_TAG=.*|API_TAG=$TAG|" .env
+
+          $COMPOSE pull api
+          $COMPOSE up -d --wait db
+          $COMPOSE run --rm -T --no-deps api ./node_modules/.bin/prisma migrate deploy < /dev/null
+          $COMPOSE up -d --wait --no-deps api
+
+          docker image prune -f
+          $COMPOSE ps
+          REMOTE
